@@ -1,0 +1,11 @@
+# Supabase local state (contains the linked project ref and local service metadata)
+.temp/
+.branches/
+
+# Local dotenv files and dotenvx keys
+.env
+.env.*
+!.env.example
+.env.keys
+.env.local
+.env.*.local

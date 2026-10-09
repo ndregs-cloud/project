@@ -1,0 +1,39 @@
+{
+  "name": "nova-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NOVA modular-monolith REST API MVP",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "node scripts/build.mjs",
+    "start": "node dist/server.js",
+    "migrate": "tsx src/migrate.ts",
+    "cleanup:feedback": "tsx src/cleanup-feedback.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.850.0",
+    "@aws-sdk/s3-request-presigner": "^3.850.0",
+    "@fastify/cors": "^11.1.0",
+    "@fastify/helmet": "^13.0.1",
+    "dotenv": "^16.6.1",
+    "fastify": "^5.4.0",
+    "jose": "^6.0.12",
+    "pg": "^8.16.3",
+    "sharp": "0.35.5",
+    "zod": "^4.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vitest": "^5.0.3"
+  }
+}
