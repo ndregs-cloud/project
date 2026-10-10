@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { requestDatabase } from '../db.js';
 import { z } from 'zod';
 import { auditStaffAccess } from './internal-audit.js';
 import { parseInput, requireModerator } from '../validation.js';
@@ -8,14 +9,14 @@ export async function registerReportMetricsRoute(app:FastifyInstance):Promise<vo
   app.get('/api/v1/moderation/reports/metrics',{config:{authRequired:true}},async(request)=>{
     const moderator=requireModerator(request);
     const {days}=parseInput(querySchema,request.query);
-    await auditStaffAccess(app,moderator.id,'moderation_reports.metrics_read',null,{days});
-    const categories=await app.pg.query(
+    await auditStaffAccess(requestDatabase(request),moderator.id,'moderation_reports.metrics_read',null,{days});
+    const categories=await requestDatabase(request).query(
       `SELECT reason AS category,count(*)::int AS volume,
          round(avg(extract(epoch FROM(first_response_at-created_at)))::numeric,1) AS "avgFirstResponseSeconds",
          sum(reopen_count)::int AS "reopenedCases"
        FROM reports WHERE created_at>=now()-($1::int*interval '1 day') GROUP BY reason ORDER BY volume DESC`,[days],
     );
-    const recurring=await app.pg.query(
+    const recurring=await requestDatabase(request).query(
       `WITH repeated AS (
          SELECT target_type,target_id,count(*)::int AS volume FROM reports
          WHERE created_at>=now()-($1::int*interval '1 day')

@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { requestDatabase } from '../db.js';
 import { decodeCursor, encodeCursor } from '../cursor.js';
 import { AppError } from '../errors.js';
 import { parseInput, parsePageSize, requireUser, uuidSchema } from '../validation.js';
@@ -13,9 +14,9 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     const user = requireUser(request);
     const { userId } = parseInput(idParams, request.params);
     if (userId === user.id) throw new AppError(400, 'INVALID_FOLLOW', 'Anda tidak dapat mengikuti diri sendiri.');
-    const target = await app.pg.query("SELECT id FROM users WHERE id=$1 AND status='active'", [userId]);
+    const target = await requestDatabase(request).query("SELECT id FROM users WHERE id=$1 AND status='active'", [userId]);
     if (!target.rowCount) throw new AppError(404, 'NOT_FOUND', 'Pengguna tidak ditemukan.');
-    await app.pg.query('INSERT INTO follows (follower_id, followed_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [user.id, userId]);
+    await requestDatabase(request).query('INSERT INTO follows (follower_id, followed_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [user.id, userId]);
     reply.code(204);
     return;
   });
@@ -23,7 +24,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
   app.delete('/api/v1/me/following/:userId', { config: { authRequired: true } }, async (request, reply) => {
     const user = requireUser(request);
     const { userId } = parseInput(idParams, request.params);
-    await app.pg.query('DELETE FROM follows WHERE follower_id=$1 AND followed_id=$2', [user.id, userId]);
+    await requestDatabase(request).query('DELETE FROM follows WHERE follower_id=$1 AND followed_id=$2', [user.id, userId]);
     reply.code(204);
     return;
   });
@@ -36,7 +37,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     const params: unknown[] = [user.id];
     const cursorSql = cursor ? (params.push(cursor.createdAt, cursor.id), `AND (f.created_at, f.followed_id) < ($2::timestamptz, $3::uuid)`) : '';
     params.push(limit + 1);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT u.id, u.username, u.display_name AS "displayName", u.bio, f.created_at AS "followedAt"
        FROM follows f JOIN users u ON u.id=f.followed_id
        WHERE f.follower_id=$1 AND u.status='active' ${cursorSql}
@@ -51,13 +52,13 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
   app.put('/api/v1/me/bookmarks/:storyId', { config: { authRequired: true, rateLimitMax: 60 } }, async (request, reply) => {
     const user = requireUser(request);
     const { storyId } = parseInput(storyParams, request.params);
-    const story = await app.pg.query(
+    const story = await requestDatabase(request).query(
       `SELECT s.id FROM stories s JOIN users creator ON creator.id=s.author_id
        WHERE s.id=$1 AND s.status='published' AND s.visibility='public'
          AND s.deleted_at IS NULL AND creator.status='active'`, [storyId],
     );
     if (!story.rowCount) throw new AppError(404, 'NOT_FOUND', 'Cerita tidak ditemukan.');
-    await app.pg.query('INSERT INTO bookmarks (user_id, story_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [user.id, storyId]);
+    await requestDatabase(request).query('INSERT INTO bookmarks (user_id, story_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [user.id, storyId]);
     reply.code(204);
     return;
   });
@@ -65,7 +66,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
   app.delete('/api/v1/me/bookmarks/:storyId', { config: { authRequired: true } }, async (request, reply) => {
     const user = requireUser(request);
     const { storyId } = parseInput(storyParams, request.params);
-    await app.pg.query('DELETE FROM bookmarks WHERE user_id=$1 AND story_id=$2', [user.id, storyId]);
+    await requestDatabase(request).query('DELETE FROM bookmarks WHERE user_id=$1 AND story_id=$2', [user.id, storyId]);
     reply.code(204);
     return;
   });
@@ -78,7 +79,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     const params: unknown[] = [user.id];
     const cursorSql = cursor ? (params.push(cursor.createdAt, cursor.id), `AND (b.created_at, b.story_id) < ($2::timestamptz, $3::uuid)`) : '';
     params.push(limit + 1);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT s.id, s.title, s.slug, s.summary, s.published_at AS "publishedAt", b.created_at AS "bookmarkedAt",
               u.id AS "authorId", u.username AS "authorUsername", u.display_name AS "authorDisplayName"
        FROM bookmarks b JOIN stories s ON s.id=b.story_id JOIN users u ON u.id=s.author_id

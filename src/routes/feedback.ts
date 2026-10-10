@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { inTransaction } from '../db.js';
+import { inRequestTransaction, requestDatabase } from '../db.js';
 import { AppError } from '../errors.js';
 import { decodeCursor, encodeCursor } from '../cursor.js';
 import { auditStaffAccess, auditStaffAccessMany } from './internal-audit.js';
@@ -38,14 +38,9 @@ export async function registerFeedbackRoutes(app: FastifyInstance): Promise<void
     const user = requireUser(request);
     const input = parseInput(feedbackSchema, request.body);
     if (input.screenshotMediaId) {
-      const media = await app.pg.query(
-        `SELECT id FROM media_assets m WHERE m.id=$1 AND m.owner_id=$2 AND m.purpose='feedback_screenshot' AND m.status='ready'
-         AND NOT EXISTS (SELECT 1 FROM beta_feedback f WHERE f.screenshot_media_id=m.id)`,
-        [input.screenshotMediaId, user.id],
-      );
-      if (!media.rowCount) throw new AppError(400, 'SCREENSHOT_NOT_READY', 'Select a verified screenshot you uploaded yourself.');
+      throw new AppError(501, 'NOT_INTEGRATED', 'Feedback screenshot attachments are unavailable for the MVP. No changes were made.');
     }
-    const result = await app.pg.query<{ id: string; createdAt: Date | string }>(
+    const result = await requestDatabase(request).query<{ id: string; createdAt: Date | string }>(
       `INSERT INTO beta_feedback (
          reporter_id, category, summary, affected_flow, expected_behavior, actual_behavior, reproduction_steps,
          impact_frequency, workaround, device_info, browser_info, occurred_at, screenshot_media_id, expires_at
@@ -66,7 +61,7 @@ export async function registerFeedbackRoutes(app: FastifyInstance): Promise<void
   app.get('/api/v1/me/feedback/:id', { config: { authRequired: true } }, async (request) => {
     const user = requireUser(request);
     const { id } = parseInput(idParams, request.params);
-    const result = await app.pg.query<{ id: string; status: string; createdAt: Date | string; updatedAt: Date | string }>(
+    const result = await requestDatabase(request).query<{ id: string; status: string; createdAt: Date | string; updatedAt: Date | string }>(
       `SELECT id, status, created_at AS "createdAt", updated_at AS "updatedAt"
        FROM beta_feedback WHERE id=$1 AND reporter_id=$2 AND expires_at>now()`, [id, user.id],
     );
@@ -89,13 +84,13 @@ export async function registerFeedbackRoutes(app: FastifyInstance): Promise<void
       conditions.push(`(created_at,id)<($${params.length - 1}::timestamptz,$${params.length}::uuid)`);
     }
     params.push(limit + 1);
-    const rows = await app.pg.query<{ id: string; category: string; status: string; createdAt: Date | string; hasScreenshot: boolean }>(
+    const rows = await requestDatabase(request).query<{ id: string; category: string; status: string; createdAt: Date | string; hasScreenshot: boolean }>(
       `SELECT id, category, status, created_at AS "createdAt", (screenshot_media_id IS NOT NULL) AS "hasScreenshot"
        FROM beta_feedback WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC,id DESC LIMIT $${params.length}`, params,
     );
     const hasMore = rows.rows.length > limit;
     const data = rows.rows.slice(0, limit);
-    await auditStaffAccessMany(app, staff.id, 'feedback.read', data.map((row) => row.id));
+    await auditStaffAccessMany(requestDatabase(request), staff.id, 'feedback.read', data.map((row) => row.id));
     const last = data.at(-1);
     return { data: data.map((row) => ({ ...row, statusLabel: statusLabels[row.status] ?? 'Received',
       statusUrl: `/api/v1/internal/feedback/${row.id}` })),
@@ -105,15 +100,15 @@ export async function registerFeedbackRoutes(app: FastifyInstance): Promise<void
   app.get('/api/v1/internal/feedback/metrics', { config: { authRequired: true } }, async (request) => {
     const staff = requireSupport(request);
     const { days } = parseInput(metricsQuery, request.query);
-    await auditStaffAccess(app, staff.id, 'feedback.metrics_read', null, { days });
-    const categories = await app.pg.query(
+    await auditStaffAccess(requestDatabase(request), staff.id, 'feedback.metrics_read', null, { days });
+    const categories = await requestDatabase(request).query(
       `SELECT category, count(*)::int AS volume,
          round(avg(extract(epoch FROM (first_response_at-created_at)))::numeric,1) AS "avgFirstResponseSeconds",
          sum(reopen_count)::int AS "reopenedCases"
        FROM beta_feedback WHERE created_at>=now()-($1::int*interval '1 day')
        GROUP BY category ORDER BY volume DESC`, [days],
     );
-    const recurring = await app.pg.query(
+    const recurring = await requestDatabase(request).query(
       `SELECT recurrence_key AS "recurrenceKey", count(*)::int AS volume
        FROM beta_feedback WHERE recurrence_key IS NOT NULL AND created_at>=now()-($1::int*interval '1 day')
        GROUP BY recurrence_key ORDER BY volume DESC LIMIT 10`, [days],
@@ -124,7 +119,7 @@ export async function registerFeedbackRoutes(app: FastifyInstance): Promise<void
   app.get('/api/v1/internal/feedback/:id', { config: { authRequired: true } }, async (request) => {
     const staff = requireSupport(request);
     const { id } = parseInput(idParams, request.params);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT id, category, summary, affected_flow AS "affectedFlow", expected_behavior AS "expectedBehavior",
          actual_behavior AS "actualBehavior", reproduction_steps AS "reproductionSteps", impact_frequency AS "impactFrequency",
          workaround, device_info AS "deviceInfo", browser_info AS "browserInfo", occurred_at AS "occurredAt",
@@ -133,21 +128,21 @@ export async function registerFeedbackRoutes(app: FastifyInstance): Promise<void
     );
     const row = result.rows[0];
     if (!row) throw new AppError(404, 'NOT_FOUND', 'Feedback case not found.');
-    await auditStaffAccess(app, staff.id, 'feedback.read', id);
+    await auditStaffAccess(requestDatabase(request), staff.id, 'feedback.read', id);
     return { data: row };
   });
 
   app.get('/api/v1/internal/feedback/:id/screenshot', { config: { authRequired: true, rateLimitMax: 10 } }, async (request, reply) => {
     const staff = requireSupport(request);
     const { id } = parseInput(idParams, request.params);
-    const result = await app.pg.query<{ mediaId: string; objectKey: string }>(
+    const result = await requestDatabase(request).query<{ mediaId: string; objectKey: string }>(
       `SELECT m.id AS "mediaId", m.object_key AS "objectKey" FROM beta_feedback f
        JOIN media_assets m ON m.id=f.screenshot_media_id
        WHERE f.id=$1 AND f.expires_at>now() AND m.status='ready' AND m.purpose='feedback_screenshot'`, [id],
     );
     const row = result.rows[0];
     if (!row) throw new AppError(404, 'NOT_FOUND', 'Screenshot not found.');
-    await auditStaffAccess(app, staff.id, 'feedback.screenshot_read', id, { mediaId: row.mediaId });
+    await auditStaffAccess(requestDatabase(request), staff.id, 'feedback.screenshot_read', id, { mediaId: row.mediaId });
     const url = await app.mediaStorage.createFeedbackScreenshotReadUrl(row.objectKey, 60);
     return reply.redirect(url, 302);
   });
@@ -156,7 +151,7 @@ export async function registerFeedbackRoutes(app: FastifyInstance): Promise<void
     const staff = requireSupport(request);
     const { id } = parseInput(idParams, request.params);
     const input = parseInput(updateSchema, request.body);
-    return { data: await inTransaction(async (client) => {
+    return { data: await inRequestTransaction(request, async (client) => {
       const current = await client.query<{ status: string }>('SELECT status FROM beta_feedback WHERE id=$1 AND expires_at>now() FOR UPDATE', [id]);
       const prior = current.rows[0]?.status;
       if (!prior) throw new AppError(404, 'NOT_FOUND', 'Feedback case not found.');

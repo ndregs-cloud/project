@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { AddressInfo } from 'node:net';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -72,6 +73,7 @@ describe('S3 cover-key rotation', () => {
     const port = (server.address() as AddressInfo).port;
     const storage = new MediaStorage(loadConfig({
       NODE_ENV: 'test', LOG_LEVEL: 'silent',
+      RATE_LIMIT_HMAC_KEY: randomBytes(32).toString('hex'),
       S3_ENDPOINT: `http://127.0.0.1:${port}`, S3_REGION: 'us-east-1', S3_BUCKET: bucket,
       S3_ACCESS_KEY_ID: 'test-access-key', S3_SECRET_ACCESS_KEY: 'test-only-secret', S3_FORCE_PATH_STYLE: 'true',
     }));

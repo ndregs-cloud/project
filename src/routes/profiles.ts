@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { requestDatabase } from '../db.js';
 import { z } from 'zod';
 import { AppError } from '../errors.js';
 import { parseInput, requireUser, usernameParamsSchema, uuidSchema } from '../validation.js';
@@ -13,25 +14,25 @@ const patchProfileSchema = z.object({
 export async function registerProfileRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/v1/me', { config: { authRequired: true } }, async (request) => {
     const user = requireUser(request);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT u.id, u.username, u.display_name AS "displayName", u.bio, u.avatar_media_id AS "avatarMediaId",
-              u.role, u.created_at AS "createdAt", u.updated_at AS "updatedAt"
+              u.created_at AS "createdAt", u.updated_at AS "updatedAt"
        FROM users u WHERE u.id = $1 AND u.status = 'active'`, [user.id],
     );
-    return { data: result.rows[0] };
+    return { data: { ...result.rows[0], role: user.role } };
   });
 
   app.patch('/api/v1/me', { config: { authRequired: true, rateLimitMax: 30 } }, async (request) => {
     const user = requireUser(request);
     const input = parseInput(patchProfileSchema, request.body);
     if (input.avatarMediaId) {
-      const media = await app.pg.query(
+      const media = await requestDatabase(request).query(
         `SELECT id FROM media_assets WHERE id = $1 AND owner_id = $2 AND status = 'ready' AND purpose = 'avatar'`,
         [input.avatarMediaId, user.id],
       );
       if (!media.rowCount) throw new AppError(400, 'MEDIA_NOT_READY', 'Avatar harus berupa media siap milik Anda.');
     }
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `UPDATE users SET
          username = COALESCE($2, username),
          username_normalized = COALESCE(lower($2), username_normalized),
@@ -40,30 +41,28 @@ export async function registerProfileRoutes(app: FastifyInstance): Promise<void>
          avatar_media_id = CASE WHEN $7::boolean THEN $8::uuid ELSE avatar_media_id END,
          updated_at = now()
        WHERE id = $1 AND status = 'active'
-       RETURNING id, username, display_name AS "displayName", bio, avatar_media_id AS "avatarMediaId", role,
+       RETURNING id, username, display_name AS "displayName", bio, avatar_media_id AS "avatarMediaId",
                  created_at AS "createdAt", updated_at AS "updatedAt"`,
       [user.id, input.username ?? null, input.displayName !== undefined, input.displayName ?? null,
         input.bio !== undefined, input.bio ?? null, input.avatarMediaId !== undefined, input.avatarMediaId ?? null],
     );
     if (!result.rowCount) throw new AppError(404, 'NOT_FOUND', 'Profil tidak ditemukan.');
-    return { data: result.rows[0] };
+    return { data: { ...result.rows[0], role: user.role } };
   });
 
   app.get('/api/v1/users/:username', { config: { authOptional: true } }, async (request) => {
     const { username } = parseInput(usernameParamsSchema, request.params);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT u.id, u.username, u.display_name AS "displayName", u.bio, u.avatar_media_id AS "avatarMediaId",
-              u.created_at AS "createdAt",
-              (SELECT count(*)::int FROM follows f WHERE f.followed_id = u.id) AS "followerCount",
-              (SELECT count(*)::int FROM follows f WHERE f.follower_id = u.id) AS "followingCount"
+              u.created_at AS "createdAt"
        FROM users u WHERE u.username_normalized = lower($1) AND u.status = 'active'`, [username],
     );
     if (!result.rowCount) throw new AppError(404, 'NOT_FOUND', 'Profil tidak ditemukan.');
     return { data: result.rows[0] };
   });
 
-  app.get('/api/v1/tags', async () => {
-    const result = await app.pg.query('SELECT id, name, normalized_name AS "normalizedName" FROM tags ORDER BY normalized_name');
+  app.get('/api/v1/tags', async (request) => {
+    const result = await requestDatabase(request).query('SELECT id, name, normalized_name AS "normalizedName" FROM tags ORDER BY normalized_name');
     return { data: result.rows };
   });
 }

@@ -6,6 +6,11 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   DATABASE_URL: z.string().min(1).optional(),
+  RATE_LIMIT_DATABASE_URL: z.string().min(1).optional(),
+  MEDIA_REVOCATION_DATABASE_URL: z.string().min(1).optional(),
+  DATABASE_ROLE: z.enum(['nova_fastify_runtime']).optional(),
+  RATE_LIMIT_DATABASE_ROLE: z.enum(['nova_rate_limiter_runtime']).optional(),
+  MEDIA_REVOCATION_DATABASE_ROLE: z.enum(['nova_media_revocation_worker']).optional(),
   DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   CORS_ORIGINS: z.string().default('http://localhost:5173'),
   TRUST_PROXY: z.string().default(''),
@@ -25,9 +30,13 @@ const envSchema = z.object({
   SECURITY_REPORT_RETENTION_DAYS: z.coerce.number().int().min(30).max(730).default(180),
   RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(120),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).default(60_000),
+  RATE_LIMIT_HMAC_KEY: z.string().min(32).optional(),
 });
 
-export type AppConfig = Omit<z.infer<typeof envSchema>, 'DATABASE_URL'> & { DATABASE_URL: string };
+export type AppConfig = Omit<z.infer<typeof envSchema>, 'DATABASE_URL' | 'RATE_LIMIT_HMAC_KEY'> & {
+  DATABASE_URL: string;
+  RATE_LIMIT_HMAC_KEY: string;
+};
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = envSchema.safeParse(env);
@@ -39,6 +48,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (config.NODE_ENV === 'production' && !config.DATABASE_URL) {
     throw new Error('Invalid environment configuration (DATABASE_URL)');
   }
+  if (config.NODE_ENV === 'production' && !config.RATE_LIMIT_DATABASE_URL) {
+    throw new Error('Invalid environment configuration (RATE_LIMIT_DATABASE_URL)');
+  }
+  if (config.NODE_ENV === 'production' && !config.MEDIA_REVOCATION_DATABASE_URL) {
+    throw new Error('Invalid environment configuration (MEDIA_REVOCATION_DATABASE_URL)');
+  }
+  if (config.NODE_ENV === 'production') {
+    for (const key of ['DATABASE_ROLE', 'RATE_LIMIT_DATABASE_ROLE', 'MEDIA_REVOCATION_DATABASE_ROLE'] as const) {
+      if (!config[key]) throw new Error(`Invalid environment configuration (${key})`);
+    }
+    if (!config.RATE_LIMIT_HMAC_KEY) throw new Error('Invalid environment configuration (RATE_LIMIT_HMAC_KEY)');
+  }
+  if (config.NODE_ENV === 'test' && !config.RATE_LIMIT_HMAC_KEY) {
+    throw new Error('Invalid environment configuration (RATE_LIMIT_HMAC_KEY)');
+  }
   if (config.NODE_ENV === 'production') {
     for (const key of ['AUTH_JWKS_URL', 'S3_ENDPOINT'] as const) {
       const endpoint = config[key];
@@ -49,7 +73,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   return {
     ...config,
-    // This convenience is for local development/tests only; production never receives a fallback.
+    // A fixed convenience fallback is limited to development; test and production require an explicit key.
     DATABASE_URL: config.DATABASE_URL ?? 'postgres://nova_local:nova-local-only-change-me@localhost:5432/nova',
+    RATE_LIMIT_HMAC_KEY: config.RATE_LIMIT_HMAC_KEY ?? 'nova-local-development-rate-limit-hmac-key',
   };
 }

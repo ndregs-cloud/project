@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { inTransaction } from '../db.js';
+import { inRequestTransaction, requestDatabase } from '../db.js';
 import { AppError } from '../errors.js';
 import { decodeCursor, encodeCursor } from '../cursor.js';
 import { auditStaffAccess, auditStaffAccessMany } from './internal-audit.js';
@@ -27,7 +27,7 @@ export async function registerSecurityReportRoutes(app: FastifyInstance): Promis
   app.post('/api/v1/security-reports', { config: { authRequired: true, rateLimitMax: 2, rateLimitWindowMs: 3_600_000 } }, async (request, reply) => {
     const user = requireUser(request);
     const input = parseInput(submissionSchema, request.body);
-    const result = await app.pg.query<{ id: string; createdAt: Date | string }>(
+    const result = await requestDatabase(request).query<{ id: string; createdAt: Date | string }>(
       `INSERT INTO security_reports (reporter_id,category,summary,details,affected_flow,impact,expires_at)
        VALUES ($1,$2,$3,$4,$5,$6,now()+($7::int*interval '1 day'))
        RETURNING id,created_at AS "createdAt"`,
@@ -44,7 +44,7 @@ export async function registerSecurityReportRoutes(app: FastifyInstance): Promis
   app.get('/api/v1/me/security-reports/:id', { config: { authRequired: true } }, async (request) => {
     const user = requireUser(request);
     const { id } = parseInput(idParams, request.params);
-    const result = await app.pg.query<{ id: string; status: string; createdAt: Date | string; updatedAt: Date | string }>(
+    const result = await requestDatabase(request).query<{ id: string; status: string; createdAt: Date | string; updatedAt: Date | string }>(
       `SELECT id,status,created_at AS "createdAt",updated_at AS "updatedAt" FROM security_reports
        WHERE id=$1 AND reporter_id=$2 AND expires_at>now()`, [id, user.id],
     );
@@ -67,13 +67,13 @@ export async function registerSecurityReportRoutes(app: FastifyInstance): Promis
       conditions.push(`(created_at,id)<($${params.length-1}::timestamptz,$${params.length}::uuid)`);
     }
     params.push(limit+1);
-    const result = await app.pg.query<{ id: string; category: string; status: string; createdAt: Date | string }>(
+    const result = await requestDatabase(request).query<{ id: string; category: string; status: string; createdAt: Date | string }>(
       `SELECT id,category,status,created_at AS "createdAt" FROM security_reports
        WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC,id DESC LIMIT $${params.length}`,params,
     );
     const hasMore = result.rows.length>limit;
     const rows = result.rows.slice(0,limit);
-    await auditStaffAccessMany(app,staff.id,'security_report.read',rows.map((row)=>row.id));
+    await auditStaffAccessMany(requestDatabase(request),staff.id,'security_report.read',rows.map((row)=>row.id));
     const last=rows.at(-1);
     return { data: rows.map((row)=>({...row,statusLabel:statusLabels[row.status]??'Received',statusUrl:`/api/v1/internal/security-reports/${row.id}`})),
       page:{hasMore,nextCursor:hasMore&&last?encodeCursor({createdAt:new Date(last.createdAt).toISOString(),id:last.id}):null} };
@@ -82,14 +82,14 @@ export async function registerSecurityReportRoutes(app: FastifyInstance): Promis
   app.get('/api/v1/internal/security-reports/metrics', { config: { authRequired: true } }, async (request) => {
     const staff = requireSecurityStaff(request);
     const { days } = parseInput(metricsQuery,request.query);
-    await auditStaffAccess(app,staff.id,'security_report.metrics_read',null,{days});
-    const byCategory=await app.pg.query(
+    await auditStaffAccess(requestDatabase(request),staff.id,'security_report.metrics_read',null,{days});
+    const byCategory=await requestDatabase(request).query(
       `SELECT category,count(*)::int AS volume,
          round(avg(extract(epoch FROM(first_response_at-created_at)))::numeric,1) AS "avgFirstResponseSeconds",
          sum(reopen_count)::int AS "reopenedCases"
        FROM security_reports WHERE created_at>=now()-($1::int*interval '1 day') GROUP BY category ORDER BY volume DESC`,[days],
     );
-    const recurring=await app.pg.query(
+    const recurring=await requestDatabase(request).query(
       `SELECT recurrence_key AS "recurrenceKey",count(*)::int AS volume FROM security_reports
        WHERE recurrence_key IS NOT NULL AND created_at>=now()-($1::int*interval '1 day')
        GROUP BY recurrence_key ORDER BY volume DESC LIMIT 10`,[days],
@@ -100,14 +100,14 @@ export async function registerSecurityReportRoutes(app: FastifyInstance): Promis
   app.get('/api/v1/internal/security-reports/:id', { config: { authRequired: true } }, async (request) => {
     const staff=requireSecurityStaff(request);
     const {id}=parseInput(idParams,request.params);
-    const result=await app.pg.query(
+    const result=await requestDatabase(request).query(
       `SELECT id,category,summary,details,affected_flow AS "affectedFlow",impact,status,
          recurrence_key AS "recurrenceKey",created_at AS "createdAt"
        FROM security_reports WHERE id=$1 AND expires_at>now()`,[id],
     );
     const row=result.rows[0];
     if(!row) throw new AppError(404,'NOT_FOUND','Security/privacy case not found.');
-    await auditStaffAccess(app,staff.id,'security_report.read',id);
+    await auditStaffAccess(requestDatabase(request),staff.id,'security_report.read',id);
     return {data:row};
   });
 
@@ -115,7 +115,7 @@ export async function registerSecurityReportRoutes(app: FastifyInstance): Promis
     const staff=requireSecurityStaff(request);
     const {id}=parseInput(idParams,request.params);
     const input=parseInput(updateSchema,request.body);
-    return {data:await inTransaction(async(client)=>{
+    return {data:await inRequestTransaction(request, async(client)=>{
       const current=await client.query<{status:string}>('SELECT status FROM security_reports WHERE id=$1 AND expires_at>now() FOR UPDATE',[id]);
       const prior=current.rows[0]?.status;
       if(!prior) throw new AppError(404,'NOT_FOUND','Security/privacy case not found.');

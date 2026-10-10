@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { inTransaction } from '../db.js';
+import { inRequestTransaction, requestDatabase } from '../db.js';
 import { AppError } from '../errors.js';
 import { decodeCursor, encodeCursor } from '../cursor.js';
 import { parseInput, parsePageSize, requireUser, uuidSchema } from '../validation.js';
@@ -40,10 +40,11 @@ export async function registerStoryRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/v1/stories', { config: { authRequired: true, rateLimitMax: 20 } }, async (request, reply) => {
     const user = requireUser(request);
     const input = parseInput(createStorySchema, request.body);
+    if (input.coverMediaId) throw new AppError(501, 'NOT_INTEGRATED', 'Story cover assignment is unavailable for the MVP. No changes were made.');
     const id = randomUUID();
     const slugBase = slugify(input.title) || 'draft';
     const slug = `${slugBase.slice(0, 150)}-${id.slice(0, 8)}`;
-    const story = await inTransaction(async (client) => {
+    const story = await inRequestTransaction(request, async (client) => {
       await validateTags(client, input.tagIds);
       await validateCover(client, input.coverMediaId, user.id);
       const inserted = await client.query(
@@ -62,7 +63,7 @@ export async function registerStoryRoutes(app: FastifyInstance): Promise<void> {
 
   app.get('/api/v1/stories/:id', { config: { authOptional: true } }, async (request, reply) => {
     const { id } = parseInput(idSchema, request.params);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT ${publicColumns}, s.status, s.visibility, s.comments_open AS "commentsOpen"
        FROM stories s JOIN users u ON u.id = s.author_id
        WHERE s.id = $1 AND s.deleted_at IS NULL AND u.status = 'active'
@@ -80,7 +81,8 @@ export async function registerStoryRoutes(app: FastifyInstance): Promise<void> {
     const user = requireUser(request);
     const { id } = parseInput(idSchema, request.params);
     const input = parseInput(patchStorySchema, request.body);
-    const story = await inTransaction(async (client) => {
+    if (input.coverMediaId) throw new AppError(501, 'NOT_INTEGRATED', 'Story cover assignment is unavailable for the MVP. No changes were made.');
+    const story = await inRequestTransaction(request, async (client) => {
       const current = await client.query<{ author_id: string; version: number; status: string }>(
         'SELECT author_id, version, status FROM stories WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [id],
       );
@@ -107,61 +109,16 @@ export async function registerStoryRoutes(app: FastifyInstance): Promise<void> {
     return { data: story };
   });
 
-  app.post('/api/v1/stories/:id/publish', { config: { authRequired: true, rateLimitMax: 15 } }, async (request, reply) => {
-    const user = requireUser(request);
-    const { id } = parseInput(idSchema, request.params);
-    const story = await inTransaction(async (client) => {
-      const current = await client.query<Record<string, unknown>>(
-        `SELECT ${publicColumns}, s.status, s.visibility, s.comments_open AS "commentsOpen"
-         FROM stories s JOIN users u ON u.id=s.author_id WHERE s.id=$1 AND s.deleted_at IS NULL FOR UPDATE OF s`, [id],
-      );
-      const row = current.rows[0];
-      if (!row || row.authorId !== user.id) throw new AppError(404, 'NOT_FOUND', 'Cerita tidak ditemukan.');
-      if (row.status === 'published') return row;
-      if (row.status !== 'draft') throw new AppError(409, 'INVALID_STATE', 'Hanya draft yang dapat diterbitkan.');
-      if (typeof row.title !== 'string' || !row.title.trim() || typeof row.body !== 'string' || !row.body.trim()) {
-        throw new AppError(422, 'PUBLISH_VALIDATION_FAILED', 'Judul dan isi cerita wajib diisi.', { title: 'Wajib diisi.', body: 'Wajib diisi.' });
-      }
-      if (row.cover_media_id) await validateCover(client, String(row.cover_media_id), user.id);
-      const update = await client.query(
-        `UPDATE stories SET status = 'published', visibility = 'public', published_at = now(), comments_open = true,
-          version = version + 1, updated_at = now() WHERE id = $1 AND status = 'draft'
-         RETURNING id, author_id AS "authorId", title, slug, summary, body, status, visibility, version,
-                   published_at AS "publishedAt", cover_media_id AS "coverMediaId", created_at AS "createdAt", updated_at AS "updatedAt"`, [id],
-      );
-      return update.rows[0];
-    });
-    reply.header('ETag', `"${(story as { version: number }).version}"`);
-    return { data: story };
+  app.post('/api/v1/stories/:id/publish', { config: { authRequired: true, rateLimitMax: 15 } }, async () => {
+    throw new AppError(501, 'NOT_INTEGRATED', 'Publish is unavailable for the MVP. No changes were made.');
   });
 
-  app.post('/api/v1/stories/:id/unpublish', { config: { authRequired: true, rateLimitMax: 15 } }, async (request) => {
-    const user = requireUser(request);
-    const { id } = parseInput(idSchema, request.params);
-    const result = await app.pg.query(
-      `UPDATE stories SET status = 'draft', visibility = 'private', published_at = NULL, comments_open = false,
-        version = version + 1, updated_at = now()
-       WHERE id = $1 AND author_id = $2 AND status = 'published' AND deleted_at IS NULL
-       RETURNING id, title, status, visibility, version, updated_at AS "updatedAt"`, [id, user.id],
-    );
-    if (!result.rowCount) {
-      const owned = await app.pg.query('SELECT 1 FROM stories WHERE id=$1 AND author_id=$2 AND status=$3 AND deleted_at IS NULL', [id, user.id, 'draft']);
-      if (owned.rowCount) return { data: { id, status: 'draft', visibility: 'private' } };
-      throw new AppError(404, 'NOT_FOUND', 'Cerita tidak ditemukan.');
-    }
-    return { data: result.rows[0] };
+  app.post('/api/v1/stories/:id/unpublish', { config: { authRequired: true, rateLimitMax: 15 } }, async () => {
+    throw new AppError(501, 'NOT_INTEGRATED', 'Unpublish is unavailable for the MVP. No changes were made.');
   });
 
-  app.delete('/api/v1/stories/:id', { config: { authRequired: true } }, async (request, reply) => {
-    const user = requireUser(request);
-    const { id } = parseInput(idSchema, request.params);
-    const result = await app.pg.query(
-      `UPDATE stories SET status = 'removed', visibility = 'private', comments_open = false, deleted_at = now(), updated_at = now(), version = version + 1
-       WHERE id = $1 AND author_id = $2 AND deleted_at IS NULL`, [id, user.id],
-    );
-    if (!result.rowCount) throw new AppError(404, 'NOT_FOUND', 'Cerita tidak ditemukan.');
-    reply.code(204);
-    return;
+  app.delete('/api/v1/stories/:id', { config: { authRequired: true } }, async () => {
+    throw new AppError(501, 'NOT_INTEGRATED', 'Delete is unavailable for the MVP. No changes were made.');
   });
 
   app.get('/api/v1/stories', { config: { authOptional: true } }, async (request) => {
@@ -183,7 +140,7 @@ export async function registerStoryRoutes(app: FastifyInstance): Promise<void> {
       conditions.push(`(s.published_at, s.id) < ($${params.length - 1}::timestamptz, $${params.length}::uuid)`);
     }
     params.push(limit + 1);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT ${publicColumns} FROM stories s JOIN users u ON u.id=s.author_id
        WHERE ${conditions.join(' AND ')} ORDER BY s.published_at DESC, s.id DESC LIMIT $${params.length}`,
       params,
@@ -206,7 +163,7 @@ export async function registerStoryRoutes(app: FastifyInstance): Promise<void> {
       cursorSql = `AND (s.created_at, s.id) < ($${params.length - 1}::timestamptz, $${params.length}::uuid)`;
     }
     params.push(limit + 1);
-    const result = await app.pg.query(
+    const result = await requestDatabase(request).query(
       `SELECT s.id, s.title, s.slug, s.summary, s.status, s.version, s.published_at AS "publishedAt",
               s.created_at AS "createdAt", s.updated_at AS "updatedAt", s.cover_media_id AS "coverMediaId"
        FROM stories s WHERE s.author_id=$1 AND s.status=$2 AND s.deleted_at IS NULL ${cursorSql}

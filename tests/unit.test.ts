@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import type { MediaStorage } from '../src/storage/s3.js';
+import { resolveIdentity } from '../src/auth.js';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { decodeCursor, encodeCursor } from '../src/cursor.js';
@@ -13,6 +15,10 @@ import { z } from 'zod';
 import sharp from 'sharp';
 
 const apps: Array<Awaited<ReturnType<typeof buildApp>>> = [];
+const ephemeralTestHmacKey = randomBytes(32).toString('hex');
+function testConfig(environment: NodeJS.ProcessEnv = {}) {
+  return loadConfig({ NODE_ENV: 'test', RATE_LIMIT_HMAC_KEY: ephemeralTestHmacKey, ...environment });
+}
 afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
 });
@@ -30,16 +36,78 @@ describe('opaque cursor', () => {
   });
 });
 
+describe('identity bootstrap security', () => {
+  it('fails closed when the identity helper is missing and never issues direct users/auth_subject SQL', async () => {
+    const statements: string[] = [];
+    const query = vi.fn(async (sql: string) => {
+      statements.push(sql);
+      if (sql.includes('nova_auth_bootstrap_identity')) {
+        throw Object.assign(new Error('sensitive helper and database detail'), { code: '42883' });
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const client = { query } as unknown as PoolClient;
+    await expect(resolveIdentity(client)).rejects.toMatchObject({
+      statusCode: 503, code: 'IDENTITY_UNAVAILABLE', message: 'Layanan identitas sementara tidak tersedia.',
+    });
+    expect(statements.some((statement) => /\bINSERT\s+INTO\s+(?:public\.)?users\b/i.test(statement))).toBe(false);
+    expect(statements.some((statement) => /\bauth_subject\b/i.test(statement))).toBe(false);
+  });
+});
+
 describe('validation and media signature checks', () => {
-  it('defaults to production and requires an explicit production database URL', () => {
+  it('defaults to production and requires explicit database URLs and principal roles', () => {
     expect(() => loadConfig({})).toThrow(/DATABASE_URL/);
-    expect(loadConfig({ DATABASE_URL: 'postgres://app:secret@db.example:5432/nova' }).NODE_ENV).toBe('production');
+    expect(() => loadConfig({ DATABASE_URL: 'postgres://app:secret@db.example:5432/nova', RATE_LIMIT_DATABASE_URL: 'postgres://limiter:secret@db.example:5432/nova' }))
+      .toThrow(/MEDIA_REVOCATION_DATABASE_URL/);
+    expect(loadConfig({
+      DATABASE_URL: 'postgres://app:secret@db.example:5432/nova',
+      RATE_LIMIT_DATABASE_URL: 'postgres://limiter:secret@db.example:5432/nova',
+      MEDIA_REVOCATION_DATABASE_URL: 'postgres://worker:secret@db.example:5432/nova',
+      DATABASE_ROLE: 'nova_fastify_runtime',
+      RATE_LIMIT_DATABASE_ROLE: 'nova_rate_limiter_runtime',
+      MEDIA_REVOCATION_DATABASE_ROLE: 'nova_media_revocation_worker',
+      RATE_LIMIT_HMAC_KEY: ephemeralTestHmacKey,
+    }).NODE_ENV).toBe('production');
+    const productionRoles = {
+      DATABASE_URL: 'postgres://app:secret@db.example:5432/nova',
+      RATE_LIMIT_DATABASE_URL: 'postgres://limiter:secret@db.example:5432/nova',
+      MEDIA_REVOCATION_DATABASE_URL: 'postgres://worker:secret@db.example:5432/nova',
+      DATABASE_ROLE: 'nova_fastify_runtime',
+      RATE_LIMIT_DATABASE_ROLE: 'nova_rate_limiter_runtime',
+      MEDIA_REVOCATION_DATABASE_ROLE: 'nova_media_revocation_worker',
+      RATE_LIMIT_HMAC_KEY: ephemeralTestHmacKey,
+    };
+    expect(() => loadConfig({ ...productionRoles, DATABASE_ROLE: undefined })).toThrow(/DATABASE_ROLE/);
+    expect(() => loadConfig({ ...productionRoles, RATE_LIMIT_DATABASE_ROLE: undefined })).toThrow(/RATE_LIMIT_DATABASE_ROLE/);
+    expect(() => loadConfig({ ...productionRoles, MEDIA_REVOCATION_DATABASE_ROLE: undefined })).toThrow(/MEDIA_REVOCATION_DATABASE_ROLE/);
+    expect(() => loadConfig({ ...productionRoles, RATE_LIMIT_HMAC_KEY: undefined })).toThrow(/RATE_LIMIT_HMAC_KEY/);
+    expect(() => loadConfig({ NODE_ENV: 'test' })).toThrow(/RATE_LIMIT_HMAC_KEY/);
+    expect(() => loadConfig({ NODE_ENV: 'test', RATE_LIMIT_HMAC_KEY: 'invalid-short-key' })).toThrow(/RATE_LIMIT_HMAC_KEY/);
+    expect(testConfig({
+      DATABASE_ROLE: 'nova_fastify_runtime',
+      RATE_LIMIT_DATABASE_ROLE: 'nova_rate_limiter_runtime',
+      MEDIA_REVOCATION_DATABASE_ROLE: 'nova_media_revocation_worker',
+    })).toMatchObject({
+      DATABASE_ROLE: 'nova_fastify_runtime',
+      RATE_LIMIT_DATABASE_ROLE: 'nova_rate_limiter_runtime',
+      MEDIA_REVOCATION_DATABASE_ROLE: 'nova_media_revocation_worker',
+    });
+    expect(() => loadConfig({ NODE_ENV: 'test', DATABASE_ROLE: 'postgres' })).toThrow(/DATABASE_ROLE/);
     expect(loadConfig({ NODE_ENV: 'development' }).DATABASE_URL)
       .toBe('postgres://nova_local:nova-local-only-change-me@localhost:5432/nova');
   });
 
   it('requires HTTPS for configured production JWKS and S3 endpoints but permits local HTTP in development', () => {
-    const production = { DATABASE_URL: 'postgres://app:secret@db.example:5432/nova' };
+    const production = {
+      DATABASE_URL: 'postgres://app:secret@db.example:5432/nova',
+      RATE_LIMIT_DATABASE_URL: 'postgres://limiter:secret@db.example:5432/nova',
+      MEDIA_REVOCATION_DATABASE_URL: 'postgres://worker:secret@db.example:5432/nova',
+      DATABASE_ROLE: 'nova_fastify_runtime',
+      RATE_LIMIT_DATABASE_ROLE: 'nova_rate_limiter_runtime',
+      MEDIA_REVOCATION_DATABASE_ROLE: 'nova_media_revocation_worker',
+      RATE_LIMIT_HMAC_KEY: ephemeralTestHmacKey,
+    };
     expect(() => loadConfig({ ...production, AUTH_JWKS_URL: 'http://identity.example/jwks' })).toThrow(/AUTH_JWKS_URL/);
     expect(() => loadConfig({ ...production, S3_ENDPOINT: 'http://storage.example' })).toThrow(/S3_ENDPOINT/);
     expect(loadConfig({ NODE_ENV: 'development', AUTH_JWKS_URL: 'http://127.0.0.1:8080/jwks' }).AUTH_JWKS_URL)
@@ -102,8 +170,9 @@ describe('API smoke checks', () => {
     const fakePool = { query } as unknown as Pool;
     const storage = { close: vi.fn(async () => undefined) } as unknown as MediaStorage;
     const app = await buildApp({
-      config: loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' }),
+      config: testConfig({ LOG_LEVEL: 'silent' }),
       pg: fakePool,
+      rateLimitPg: fakePool,
       mediaStorage: storage,
     });
     apps.push(app);
@@ -116,12 +185,45 @@ describe('API smoke checks', () => {
     expect(query).not.toHaveBeenCalled();
   });
 
+  it('omits unavailable follower and following counts from public profiles instead of returning zero', async () => {
+    const profile = {
+      id: '11111111-1111-4111-8111-111111111111', username: 'reader', displayName: 'Reader',
+      bio: null, avatarMediaId: null, createdAt: '2026-10-10T00:00:00.000Z',
+    };
+    const statements: string[] = [];
+    const query = vi.fn(async (sql: string) => {
+      statements.push(sql);
+      if (sql.includes('nova_rate_limit_record')) return { rows: [{ hits: 1 }], rowCount: 1 };
+      if (sql.includes('FROM users u WHERE u.username_normalized')) return { rows: [profile], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+    const fakePool = { query } as unknown as Pool;
+    const storage = { close: vi.fn(async () => undefined) } as unknown as MediaStorage;
+    const app = await buildApp({
+      config: testConfig({ LOG_LEVEL: 'silent' }),
+      pg: fakePool,
+      rateLimitPg: fakePool,
+      mediaStorage: storage,
+    });
+    apps.push(app);
+
+    const response = await app.inject({ method: 'GET', url: '/api/v1/users/reader' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ data: profile });
+    expect(response.json().data).not.toHaveProperty('followerCount');
+    expect(response.json().data).not.toHaveProperty('followingCount');
+    const profileQuery = statements.find((sql) => sql.includes('FROM users u WHERE u.username_normalized'));
+    expect(profileQuery).toBeDefined();
+    expect(profileQuery).not.toMatch(/\bfollows\b|\bcount\s*\(/i);
+  });
+
   it('requires a verified bearer token to create a draft', async () => {
     const fakePool = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as unknown as Pool;
     const storage = { close: vi.fn(async () => undefined) } as unknown as MediaStorage;
     const app = await buildApp({
-      config: loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' }),
+      config: testConfig({ LOG_LEVEL: 'silent' }),
       pg: fakePool,
+      rateLimitPg: fakePool,
       mediaStorage: storage,
     });
     apps.push(app);
@@ -137,8 +239,9 @@ describe('API smoke checks', () => {
     const fakePool = { query } as unknown as Pool;
     const storage = { close: vi.fn(async () => undefined) } as unknown as MediaStorage;
     const app = await buildApp({
-      config: loadConfig({ NODE_ENV: 'test', RATE_LIMIT_MAX: '1', LOG_LEVEL: 'silent' }),
+      config: testConfig({ RATE_LIMIT_MAX: '1', LOG_LEVEL: 'silent' }),
       pg: fakePool,
+      rateLimitPg: fakePool,
       mediaStorage: storage,
     });
     apps.push(app);
@@ -154,7 +257,7 @@ describe('cover access revocation', () => {
   it('rechecks a previously fetched API cover URL and prevents shared caching', async () => {
     let permitted = true;
     const query = vi.fn(async (sql: string) => {
-      if (sql.includes('INSERT INTO rate_limit_buckets')) return { rows: [{ hits: 1 }], rowCount: 1 };
+      if (sql.includes('nova_rate_limit_record')) return { rows: [{ hits: 1 }], rowCount: 1 };
       return permitted
         ? { rows: [{ object_key: 'ready/fictional/cover.jpg', mime_type: 'image/jpeg' }], rowCount: 1 }
         : { rows: [], rowCount: 0 };
@@ -164,8 +267,9 @@ describe('cover access revocation', () => {
     const readObject = vi.fn(async () => ({ body: Readable.from([image]), contentLength: image.length }));
     const storage = { readObject, close: vi.fn(async () => undefined) } as unknown as MediaStorage;
     const app = await buildApp({
-      config: loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' }),
+      config: testConfig({ LOG_LEVEL: 'silent' }),
       pg: fakePool,
+      rateLimitPg: fakePool,
       mediaStorage: storage,
     });
     apps.push(app);

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
-import { pool } from './db.js';
+import { mediaRevocationPool, pool, rateLimitPool, validateDatabasePrincipals } from './db.js';
 import { loadConfig, type AppConfig } from './config.js';
 import { registerAuth } from './auth.js';
 import { registerRateLimiting } from './rate-limit.js';
@@ -25,12 +25,20 @@ import { processPendingMediaKeyRevocations } from './media-key-revocations.js';
 export interface AppDependencies {
   config?: AppConfig;
   pg?: Pool;
+  rateLimitPg?: Pool;
+  mediaRevocationPg?: Pool;
   mediaStorage?: MediaStorage;
+  validatePrincipalStartup?: boolean;
 }
 
 export async function buildApp(dependencies: AppDependencies = {}): Promise<FastifyInstance> {
   const config = dependencies.config ?? loadConfig();
   const database = dependencies.pg ?? pool;
+  const rateLimitDatabase = dependencies.rateLimitPg ?? rateLimitPool;
+  const mediaRevocationDatabase = dependencies.mediaRevocationPg ?? mediaRevocationPool;
+  if (config.NODE_ENV === 'production' || dependencies.validatePrincipalStartup === true) {
+    await validateDatabasePrincipals(database, rateLimitDatabase, mediaRevocationDatabase);
+  }
   const mediaStorage = dependencies.mediaStorage ?? new MediaStorage(config);
   const app = Fastify({
     genReqId: () => `req_${randomUUID().replaceAll('-', '')}`,
@@ -44,6 +52,8 @@ export async function buildApp(dependencies: AppDependencies = {}): Promise<Fast
   });
 
   app.decorate('pg', database);
+  app.decorate('rateLimitPg', rateLimitDatabase);
+  app.decorate('mediaRevocationPg', mediaRevocationDatabase);
   app.decorate('config', config);
   app.decorate('mediaStorage', mediaStorage);
   await app.register(cors, {
@@ -114,11 +124,14 @@ export async function buildApp(dependencies: AppDependencies = {}): Promise<Fast
 declare module 'fastify' {
   interface FastifyInstance {
     pg: Pool;
+    rateLimitPg: Pool;
+    mediaRevocationPg: Pool;
     config: AppConfig;
     mediaStorage: MediaStorage;
   }
   interface FastifyRequest {
     user: AuthUser | null;
+    db: import('pg').PoolClient | null;
   }
   interface FastifyContextConfig {
     rateLimitMax?: number;

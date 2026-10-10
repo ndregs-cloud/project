@@ -6,6 +6,7 @@ export class AppError extends Error {
     public readonly code: string,
     message: string,
     public readonly fields?: Record<string, string>,
+    public readonly retryable = false,
   ) {
     super(message);
     this.name = 'AppError';
@@ -19,11 +20,13 @@ export function fail(statusCode: number, code: string, message: string, fields?:
 export function installErrorHandler(app: import('fastify').FastifyInstance): void {
   app.setErrorHandler((error: Error & { statusCode?: number; validation?: unknown; code?: string }, request: FastifyRequest, reply: FastifyReply) => {
     if (error instanceof AppError) {
+      if (error.retryable) reply.header('Retry-After', '5');
       return reply.code(error.statusCode).send({
         error: {
           code: error.code,
           message: error.message,
           requestId: request.id,
+          retryable: error.retryable,
           ...(error.fields ? { fields: error.fields } : {}),
         },
       });

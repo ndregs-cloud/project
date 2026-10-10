@@ -1,4 +1,6 @@
-import type { FastifyInstance } from 'fastify';
+import type { Pool, PoolClient } from 'pg';
+
+type DatabaseExecutor = Pool | PoolClient;
 
 export type StaffAuditEvent =
   | 'content_report.read' | 'content_report.status_changed'
@@ -7,13 +9,13 @@ export type StaffAuditEvent =
   | 'moderation_reports.metrics_read';
 
 export async function auditStaffAccess(
-  app: FastifyInstance,
+  database: DatabaseExecutor,
   staffId: string,
   eventType: StaffAuditEvent,
   resourceId: string | null,
   metadata: Record<string, unknown> = {},
 ): Promise<void> {
-  await app.pg.query(
+  await database.query(
     `INSERT INTO staff_access_audit (staff_id, event_type, resource_id, metadata)
      VALUES ($1, $2, $3, $4::jsonb)`,
     [staffId, eventType, resourceId, JSON.stringify(metadata)],
@@ -21,13 +23,13 @@ export async function auditStaffAccess(
 }
 
 export async function auditStaffAccessMany(
-  app: FastifyInstance,
+  database: DatabaseExecutor,
   staffId: string,
   eventType: StaffAuditEvent,
   resourceIds: string[],
 ): Promise<void> {
   if (resourceIds.length === 0) return;
-  await app.pg.query(
+  await database.query(
     `INSERT INTO staff_access_audit (staff_id, event_type, resource_id)
      SELECT $1, $2, ids.resource_id FROM unnest($3::uuid[]) AS ids(resource_id)`,
     [staffId, eventType, resourceIds],
